@@ -949,6 +949,7 @@ TEST_F(NodeHostTest, TooSmallTimeoutIsReported)
 TEST_F(NodeHostTest, TooBigPayloadIsReported)
 {
   auto config = getTestConfig();
+  config.MaxInMemLogSize = 1024 * 1024;
   dragonboat::Peers p;
   p.AddMember("localhost:9050", 1);
   dragonboat::Status s = nh_->StartCluster(
@@ -960,7 +961,7 @@ TEST_F(NodeHostTest, TooBigPayloadIsReported)
   std::unique_ptr<dragonboat::Session> cs(nh_->SyncGetSession(1, timeout, &s));
   EXPECT_TRUE(s.OK());
   dragonboat::UpdateResult code;
-  int sz = 1024 * 1024 * 128;
+  int sz = 1024 * 1024 * 2;
   dragonboat::Buffer buf(sz);
   s = nh_->SyncPropose(cs.get(), buf, timeout, &code);
   EXPECT_FALSE(s.OK());
@@ -1514,6 +1515,45 @@ TEST_F(NodeHostTest, FailedToLaunchAsyncSnapshot)
 TEST_F(NodeHostTest, RegularSMSnapshotCanBeCapturedAndRestored)
 {
   auto config = getTestConfig();
+  dragonboat::Peers p;
+  p.AddMember("localhost:9050", 1);
+  dragonboat::Status s = nh_->StartCluster(
+    p, false, CreateRegularStateMachine,
+    config);
+  EXPECT_TRUE(s.OK());
+  auto timeout = dragonboat::Milliseconds(5000);
+  waitForElectionToComplete();
+  std::unique_ptr<dragonboat::Session> cs(nh_->SyncGetSession(1, timeout, &s));
+  EXPECT_TRUE(s.OK());
+  dragonboat::Buffer buf(128);
+  for (uint64_t i = 0; i < 64; i++) {
+    dragonboat::UpdateResult code;
+    dragonboat::Status s = nh_->SyncPropose(cs.get(), buf, timeout, &code);
+    EXPECT_TRUE(s.OK());
+    cs->ProposalCompleted();
+  }
+  nh_->Stop();
+  auto nhConfig = getTestNodeHostConfig();
+  nh_.reset(new dragonboat::NodeHost(nhConfig));
+  s = nh_->StartCluster(p, false, CreateRegularStateMachine, config);
+  EXPECT_TRUE(s.OK());
+  waitForElectionToComplete();
+  dragonboat::Buffer query(128);
+  dragonboat::Buffer result(128);
+  s = nh_->SyncRead(1, query, &result, timeout);
+  EXPECT_TRUE(s.OK());
+  EXPECT_EQ(result.Len(), 8);
+  uint64_t *count = (uint64_t *) (result.Data());
+  // applied index is 66, one is the empty entry proposed after the leader is
+  // elected, one is the membership change entry. both of these two are not
+  // visible to the StateMachine, so the returned count is 64
+  EXPECT_EQ(*count, 64);
+}
+
+TEST_F(NodeHostTest, RegularSMSnapshotUsingSnappyCanBeCapturedAndRestored)
+{
+  auto config = getTestConfig();
+  config.SnapshotCompressionType = SNAPPY;
   dragonboat::Peers p;
   p.AddMember("localhost:9050", 1);
   dragonboat::Status s = nh_->StartCluster(

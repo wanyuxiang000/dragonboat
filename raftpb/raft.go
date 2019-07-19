@@ -19,10 +19,11 @@ import (
 	"math"
 	"os"
 	"strings"
+	"unsafe"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/stringutil"
+	"github.com/lni/goutils/stringutil"
 	"github.com/lni/dragonboat/v3/logger"
 )
 
@@ -72,6 +73,9 @@ type Update struct {
 	// persistent storage before any non-replication can be sent to other nodes.
 	// isStateEqual(emptyState) returns true when the state is empty.
 	State
+	// whether CommittedEntries can be applied without waiting for the Update
+	// to be persisted to disk
+	FastApply bool
 	// EntriesToSave are entries waiting to be stored onto persistent storage.
 	EntriesToSave []Entry
 	// CommittedEntries are entries already committed in raft and ready to be
@@ -297,6 +301,21 @@ func GetEntrySliceSize(ents []Entry) uint64 {
 	sz := uint64(0)
 	for _, e := range ents {
 		sz += uint64(e.SizeUpperLimit())
+	}
+	return sz
+}
+
+// GetEntrySliceInMemSize returns the in memory size of the specified entry
+// slice. Size 24 bytes used to hold ents itself is not counted.
+func GetEntrySliceInMemSize(ents []Entry) uint64 {
+	sz := uint64(0)
+	if len(ents) == 0 {
+		return 0
+	}
+	stSz := uint64(unsafe.Sizeof(ents[0]))
+	for _, e := range ents {
+		sz += uint64(len(e.Cmd))
+		sz += stSz
 	}
 	return sz
 }

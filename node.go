@@ -28,12 +28,12 @@ import (
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/tests"
 	"github.com/lni/dragonboat/v3/internal/transport"
-	"github.com/lni/dragonboat/v3/internal/utils/fileutil"
-	"github.com/lni/dragonboat/v3/internal/utils/logutil"
-	"github.com/lni/dragonboat/v3/internal/utils/syncutil"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
+	"github.com/lni/goutils/fileutil"
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/syncutil"
 )
 
 var (
@@ -58,7 +58,7 @@ type node struct {
 	raftAddress          string
 	config               config.Config
 	confChangeC          <-chan configChangeRequest
-	snapshotC            <-chan rsm.SnapshotRequest
+	snapshotC            <-chan rsm.SSRequest
 	taskQ                *rsm.TaskQueue
 	mq                   *server.MessageQueue
 	smAppliedIndex       uint64
@@ -125,7 +125,7 @@ func newNode(raftAddress string,
 	proposals := newEntryQueue(incomingProposalsMaxLen, lazyFreeCycle)
 	readIndexes := newReadIndexQueue(incomingReadIndexMaxLen)
 	confChangeC := make(chan configChangeRequest, 1)
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	pp := newPendingProposal(requestStatePool,
 		proposals, config.ClusterID, config.NodeID, raftAddress, tickMillisecond)
 	pscr := newPendingReadIndex(requestStatePool, readIndexes, tickMillisecond)
@@ -166,8 +166,7 @@ func newNode(raftAddress string,
 			nodeID:       config.NodeID,
 		},
 	}
-	ordered := config.OrderedConfigChange
-	sm := rsm.NewStateMachine(dataStore, snapshotter, ordered, rn)
+	sm := rsm.NewStateMachine(dataStore, snapshotter, config, rn)
 	rn.taskQ = sm.TaskQ()
 	rn.sm = sm
 	rn.raftEvents = newRaftEventListener(config.ClusterID,
@@ -309,7 +308,7 @@ func (n *node) shouldStop() <-chan struct{} {
 }
 
 func (n *node) concurrentSnapshot() bool {
-	return n.sm.ConcurrentSnapshot()
+	return n.sm.Concurrent()
 }
 
 func (n *node) supportClientSession() bool {
@@ -379,7 +378,11 @@ func (n *node) requestSnapshot(opt SnapshotOption,
 			opt.ExportPath = ""
 		}
 	}
-	return n.pendingSnapshot.request(st, opt.ExportPath, timeout)
+	return n.pendingSnapshot.request(st,
+		opt.ExportPath,
+		opt.OverrideCompactionOverhead,
+		opt.CompactionOverhead,
+		timeout)
 }
 
 func (n *node) reportIgnoredSnapshotRequest(key uint64) {
@@ -479,8 +482,8 @@ func (n *node) pushStreamSnapshotRequest(clusterID uint64, nodeID uint64) bool {
 	return n.pushTask(rec)
 }
 
-func (n *node) pushTakeSnapshotRequest(req rsm.SnapshotRequest) bool {
-	rec := rsm.Task{SnapshotRequested: true, SnapshotRequest: req}
+func (n *node) pushTakeSnapshotRequest(req rsm.SSRequest) bool {
+	rec := rsm.Task{SnapshotRequested: true, SSRequest: req}
 	return n.pushTask(rec)
 }
 
@@ -561,15 +564,15 @@ func isSoftSnapshotError(err error) bool {
 }
 
 func (n *node) saveSnapshot(rec rsm.Task) error {
-	index, err := n.doSaveSnapshot(rec.SnapshotRequest)
+	index, err := n.doSaveSnapshot(rec.SSRequest)
 	if err != nil {
 		return err
 	}
-	n.pendingSnapshot.apply(rec.SnapshotRequest.Key, index == 0, index)
+	n.pendingSnapshot.apply(rec.SSRequest.Key, index == 0, index)
 	return nil
 }
 
-func (n *node) doSaveSnapshot(req rsm.SnapshotRequest) (uint64, error) {
+func (n *node) doSaveSnapshot(req rsm.SSRequest) (uint64, error) {
 	n.snapshotLock.Lock()
 	defer n.snapshotLock.Unlock()
 	if !req.IsExportedSnapshot() &&
@@ -620,15 +623,23 @@ func (n *node) doSaveSnapshot(req rsm.SnapshotRequest) (uint64, error) {
 		}
 		return 0, nil
 	}
-	if ss.Index > n.config.CompactionOverhead {
-		n.ss.setCompactLogTo(ss.Index - n.config.CompactionOverhead)
-		if err := n.snapshotter.Compact(ss.Index); err != nil {
-			plog.Errorf("%s snapshotter.Compact failed %v", n.id(), err)
-			return 0, err
-		}
+	compactionOverhead := n.getCompactionOverhead(req)
+	if ss.Index > compactionOverhead {
+		n.ss.setCompactLogTo(ss.Index - compactionOverhead)
+	}
+	if err := n.snapshotter.Compact(ss.Index); err != nil {
+		plog.Errorf("%s snapshotter.Compact failed %v", n.id(), err)
+		return 0, err
 	}
 	n.ss.setSnapshotIndex(ss.Index)
 	return ss.Index, nil
+}
+
+func (n *node) getCompactionOverhead(req rsm.SSRequest) uint64 {
+	if req.OverrideCompaction {
+		return req.CompactionOverhead
+	}
+	return n.config.CompactionOverhead
 }
 
 func (n *node) streamSnapshot(sink pb.IChunkSink) error {
@@ -927,7 +938,7 @@ func (n *node) processRaftUpdate(ud pb.Update) (bool, error) {
 		return false, nil
 	}
 	if n.saveSnapshotRequired(ud.LastApplied) {
-		return n.pushTakeSnapshotRequest(rsm.SnapshotRequest{}), nil
+		return n.pushTakeSnapshotRequest(rsm.SSRequest{}), nil
 	}
 	return true, nil
 }
@@ -1003,14 +1014,13 @@ func (n *node) handleEvents() bool {
 }
 
 func (n *node) handleSnapshotRequest(lastApplied uint64) bool {
-	var req rsm.SnapshotRequest
+	var req rsm.SSRequest
 	select {
 	case req = <-n.snapshotC:
 	default:
 		return false
 	}
 	si := n.ss.getReqSnapshotIndex()
-	plog.Infof("req: %+v", req)
 	if !req.IsExportedSnapshot() && lastApplied == si {
 		n.reportIgnoredSnapshotRequest(req.Key)
 		return false
@@ -1170,7 +1180,7 @@ func (n *node) handleSnapshotTask(task rsm.Task) {
 		plog.Infof("reportRequestedSnapshot, %s", n.id())
 		if n.ss.takingSnapshot() {
 			plog.Infof("task.SnapshotRequested ignored on %s", n.id())
-			n.reportIgnoredSnapshotRequest(task.SnapshotRequest.Key)
+			n.reportIgnoredSnapshotRequest(task.SSRequest.Key)
 			return
 		}
 		n.reportRequestedSnapshot(task)

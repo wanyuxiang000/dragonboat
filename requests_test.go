@@ -18,7 +18,6 @@
 package dragonboat
 
 import (
-	"bytes"
 	"math/rand"
 	"reflect"
 	"sync"
@@ -28,7 +27,7 @@ import (
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/internal/rsm"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
+	"github.com/lni/goutils/random"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 )
@@ -60,7 +59,7 @@ func TestRequestStatePanicWhenNotReadyForRead(t *testing.T) {
 }
 
 func TestPendingSnapshotCanBeCreatedAndClosed(t *testing.T) {
-	snapshotC := make(chan<- rsm.SnapshotRequest, 1)
+	snapshotC := make(chan<- rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
 	if len(ps.snapshotC) != 0 {
 		t.Errorf("snapshotC not empty")
@@ -87,9 +86,9 @@ func TestPendingSnapshotCanBeCreatedAndClosed(t *testing.T) {
 }
 
 func TestPendingSnapshotCanBeRequested(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -110,9 +109,9 @@ func TestPendingSnapshotCanBeRequested(t *testing.T) {
 }
 
 func TestTooSmallSnapshotTimeoutIsRejected(t *testing.T) {
-	snapshotC := make(chan<- rsm.SnapshotRequest, 1)
+	snapshotC := make(chan<- rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, 50)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", 49*time.Millisecond)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, 49*time.Millisecond)
 	if err != ErrTimeoutTooSmall {
 		t.Errorf("request not rejected")
 	}
@@ -122,16 +121,16 @@ func TestTooSmallSnapshotTimeoutIsRejected(t *testing.T) {
 }
 
 func TestMultiplePendingSnapshotIsNotAllowed(t *testing.T) {
-	snapshotC := make(chan<- rsm.SnapshotRequest, 1)
+	snapshotC := make(chan<- rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
 	if ss == nil {
 		t.Errorf("nil ss returned")
 	}
-	ss, err = ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err = ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != ErrPendingSnapshotRequestExist {
 		t.Errorf("request not rejected")
 	}
@@ -141,9 +140,9 @@ func TestMultiplePendingSnapshotIsNotAllowed(t *testing.T) {
 }
 
 func TestPendingSnapshotCanBeGCed(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -176,9 +175,9 @@ func TestPendingSnapshotCanBeGCed(t *testing.T) {
 }
 
 func TestPendingSnapshotCanBeApplied(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -200,9 +199,9 @@ func TestPendingSnapshotCanBeApplied(t *testing.T) {
 }
 
 func TestPendingSnapshotCanBeIgnored(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -224,9 +223,9 @@ func TestPendingSnapshotCanBeIgnored(t *testing.T) {
 }
 
 func TestPendingSnapshotIsIdentifiedByTheKey(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -248,15 +247,32 @@ func TestPendingSnapshotIsIdentifiedByTheKey(t *testing.T) {
 }
 
 func TestSnapshotCanNotBeRequestedAfterClose(t *testing.T) {
-	snapshotC := make(chan rsm.SnapshotRequest, 1)
+	snapshotC := make(chan rsm.SSRequest, 1)
 	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
 	ps.close()
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", time.Second)
+	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
 	if err != ErrClusterClosed {
 		t.Errorf("not report as closed")
 	}
 	if ss != nil {
 		t.Errorf("snapshot state returned")
+	}
+}
+
+func TestCompactionOverheadDetailsIsRecorded(t *testing.T) {
+	snapshotC := make(chan rsm.SSRequest, 1)
+	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
+	_, err := ps.request(rsm.UserRequestedSnapshot, "", true, 123, time.Second)
+	if err != nil {
+		t.Errorf("failed to request snapshot")
+	}
+	select {
+	case req := <-snapshotC:
+		if !req.OverrideCompaction || req.CompactionOverhead != 123 {
+			t.Errorf("compaction details not recorded")
+		}
+	default:
+		t.Errorf("snapshot request not available")
 	}
 }
 
@@ -763,36 +779,6 @@ func TestProposalErrorsAreReported(t *testing.T) {
 	_, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
 	if err != ErrSystemBusy {
 		t.Errorf("suppose to return ErrSystemBusy")
-	}
-	if c.leftInWrite {
-		cq = c.left
-	} else {
-		cq = c.right
-	}
-	if len(cq) != sz {
-		t.Errorf("len(c)=%d, want %d", len(cq), sz)
-	}
-	pp, c = getPendingProposal()
-	var buffer bytes.Buffer
-	for i := uint64(0); i < maxProposalPayloadSize; i++ {
-		buffer.WriteString("a")
-	}
-	data := buffer.Bytes()
-	_, err = pp.propose(getBlankTestSession(), data, nil, time.Second)
-	if err != nil {
-		t.Errorf("suppose to be successful")
-	}
-	buffer.WriteString("a")
-	data = buffer.Bytes()
-	if c.leftInWrite {
-		cq = c.left
-	} else {
-		cq = c.right
-	}
-	sz = len(cq)
-	_, err = pp.propose(getBlankTestSession(), data, nil, time.Second)
-	if err != ErrPayloadTooBig {
-		t.Errorf("suppose to return ErrPayloadTooBig")
 	}
 	if c.leftInWrite {
 		cq = c.left

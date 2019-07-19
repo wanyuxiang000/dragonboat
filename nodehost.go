@@ -99,11 +99,11 @@ import (
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/transport"
-	"github.com/lni/dragonboat/v3/internal/utils/logutil"
-	"github.com/lni/dragonboat/v3/internal/utils/syncutil"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/syncutil"
 )
 
 const (
@@ -210,6 +210,15 @@ type SnapshotOption struct {
 	// must point to an existing directory for which the current user has write
 	// permission to it.
 	ExportPath string
+	// OverrideCompactionOverhead defines whether the requested snapshot operation
+	// should override the compaction overhead setting specified in node's config.
+	// This field is ignored by the system when exporting a snapshot, that is when
+	// Exported is true.
+	OverrideCompactionOverhead bool
+	// CompactionOverhead is the compaction overhead value to use for the request
+	// snapshot operation when OverrideCompactionOverhead is true. This field is
+	// ignored when exporting a snapshot, that is when Exported is true.
+	CompactionOverhead uint64
 }
 
 // DefaultSnapshotOption is the default SnapshotOption value to use when
@@ -408,7 +417,7 @@ func (nh *NodeHost) StartCluster(nodes map[uint64]string,
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeStateMachine(clusterID,
+		return rsm.NewNativeSM(clusterID,
 			nodeID, rsm.NewRegularStateMachine(sm), done)
 	}
 	return nh.startCluster(nodes, join, cf, stopc, config, pb.RegularStateMachine)
@@ -424,7 +433,7 @@ func (nh *NodeHost) StartConcurrentCluster(nodes map[uint64]string,
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeStateMachine(clusterID,
+		return rsm.NewNativeSM(clusterID,
 			nodeID, rsm.NewConcurrentStateMachine(sm), done)
 	}
 	return nh.startCluster(nodes, join, cf, stopc, config, pb.ConcurrentStateMachine)
@@ -440,7 +449,7 @@ func (nh *NodeHost) StartOnDiskCluster(nodes map[uint64]string,
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeStateMachine(clusterID,
+		return rsm.NewNativeSM(clusterID,
 			nodeID, rsm.NewOnDiskStateMachine(sm), done)
 	}
 	return nh.startCluster(nodes, join, cf, stopc, config, pb.OnDiskStateMachine)
@@ -1441,7 +1450,7 @@ func (nh *NodeHost) startCluster(nodes map[uint64]string,
 		nh.msgHandler.HandleSnapshotStatus(cid, nid, failed)
 	}
 	snapshotter := newSnapshotter(clusterID, nodeID,
-		getSnapshotDirFunc, nh.logdb, stopc)
+		nh.nhConfig, getSnapshotDirFunc, nh.logdb, stopc)
 	if err := snapshotter.ProcessOrphans(); err != nil {
 		panic(err)
 	}

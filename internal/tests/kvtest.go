@@ -36,8 +36,8 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/lni/dragonboat/v3/internal/tests/kvpb"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
 	sm "github.com/lni/dragonboat/v3/statemachine"
+	"github.com/lni/goutils/random"
 )
 
 // random delays
@@ -313,4 +313,59 @@ func (s *KVTest) GetHash() (uint64, error) {
 
 func (s *KVTest) updateStore(key string, value string) {
 	s.KVStore[key] = value
+}
+
+// VerboseSnapshotSM ...
+type VerboseSnapshotSM struct {
+	sz uint64
+}
+
+// Update ...
+func (v *VerboseSnapshotSM) Update(data []byte) (sm.Result, error) {
+	return sm.Result{}, nil
+}
+
+// Lookup ...
+func (v *VerboseSnapshotSM) Lookup(q interface{}) (interface{}, error) {
+	return v.sz, nil
+}
+
+// SsaveSnapshot ...
+func (v *VerboseSnapshotSM) SaveSnapshot(w io.Writer,
+	collection sm.ISnapshotFileCollection, stopc <-chan struct{}) error {
+	empty := make([]byte, 1024)
+	for i := 0; i < 1024; i++ {
+		if _, err := w.Write(empty); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RecoverFromSnapshot ...
+func (v *VerboseSnapshotSM) RecoverFromSnapshot(r io.Reader,
+	collection []sm.SnapshotFile, stopc <-chan struct{}) error {
+	data := make([]byte, 1024)
+	total := uint64(0)
+	defer func() {
+		v.sz = total
+	}()
+	for {
+		n, err := r.Read(data)
+		if n > 0 {
+			total += uint64(n)
+		}
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// Close ...
+func (v *VerboseSnapshotSM) Close() error {
+	return nil
 }

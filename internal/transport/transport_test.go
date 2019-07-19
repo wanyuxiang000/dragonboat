@@ -31,12 +31,11 @@ import (
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/leaktest"
-	"github.com/lni/dragonboat/v3/internal/utils/netutil"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
-	"github.com/lni/dragonboat/v3/internal/utils/syncutil"
 	"github.com/lni/dragonboat/v3/raftio"
 	"github.com/lni/dragonboat/v3/raftpb"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/goutils/netutil"
+	"github.com/lni/goutils/syncutil"
 )
 
 const (
@@ -112,7 +111,8 @@ func (g *testSnapshotDir) generateSnapshotFile(clusterID uint64,
 	fp := filepath.Join(snapDir, filename)
 	data := make([]byte, sz)
 	rand.Read(data)
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp,
+		rsm.SnapshotVersion, raftpb.NoCompression)
 	if err != nil {
 		panic(err)
 	}
@@ -361,16 +361,19 @@ func testMessageCanBeSent(t *testing.T, mutualTLS bool, sz uint64) {
 	done := false
 	for i := 0; i < 200; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if handler.getRequestCount(100, 2) == 20 {
+		count := handler.getRequestCount(100, 2)
+		if count == 20 {
 			done = true
 			break
+		} else {
+			plog.Infof("count: %d, want 20, will wait for 100ms", count)
 		}
 	}
 	if !done {
 		t.Errorf("failed to get all 20 sent messages")
 	}
 	// test to ensure a single big message can be sent/received.
-	payload := []byte(random.String(int(sz)))
+	payload := make([]byte, sz)
 	m := raftpb.Message{
 		Type:      raftpb.Replicate,
 		To:        2,
@@ -400,13 +403,13 @@ func testMessageCanBeSent(t *testing.T, mutualTLS bool, sz uint64) {
 
 func TestMessageCanBeSent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testMessageCanBeSent(t, false, settings.MaxProposalPayloadSize*2)
+	testMessageCanBeSent(t, false, settings.LargeEntitySize*2)
 	testMessageCanBeSent(t, false, recvBufSize/2)
 	testMessageCanBeSent(t, false, recvBufSize+1)
 	testMessageCanBeSent(t, false, perConnBufSize+1)
 	testMessageCanBeSent(t, false, perConnBufSize/2)
 	testMessageCanBeSent(t, false, 1)
-	testMessageCanBeSent(t, true, settings.MaxProposalPayloadSize*2)
+	testMessageCanBeSent(t, true, settings.LargeEntitySize*2)
 	testMessageCanBeSent(t, true, recvBufSize/2)
 	testMessageCanBeSent(t, true, recvBufSize+1)
 	testMessageCanBeSent(t, true, perConnBufSize+1)
@@ -733,9 +736,9 @@ func waitForSnapshotCountUpdate(handler *testMessageHandler, maxWait uint64) {
 }
 
 func getTestSnapshotFileSize(sz uint64) uint64 {
-	if rsm.CurrentSnapshotVersion == rsm.V1SnapshotVersion {
+	if rsm.SnapshotVersion == rsm.V1SnapshotVersion {
 		return sz*2 + rsm.SnapshotHeaderSize
-	} else if rsm.CurrentSnapshotVersion == rsm.V2SnapshotVersion {
+	} else if rsm.SnapshotVersion == rsm.V2SnapshotVersion {
 		return rsm.GetV2PayloadSize(sz*2) + rsm.SnapshotHeaderSize
 	} else {
 		panic("unknown snapshot version")

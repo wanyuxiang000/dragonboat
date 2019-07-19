@@ -232,7 +232,11 @@ func TestInMemRestore(t *testing.T) {
 		},
 	}
 	ss := pb.Snapshot{Index: 100}
+	im.shrunk = true
 	im.restore(ss)
+	if im.shrunk {
+		t.Errorf("shrunk flag not cleared")
+	}
 	if len(im.entries) != 0 || im.markerIndex != 101 || im.snapshot == nil {
 		t.Errorf("unexpected im state")
 	}
@@ -254,20 +258,25 @@ func TestInMemSaveSnapshotTo(t *testing.T) {
 	}
 }
 
-func TestInMemMergeFullAppend(t *testing.T) {
+func testInMemMergeFullAppend(t *testing.T, shrunk bool) {
 	im := inMemory{
 		markerIndex: 5,
-		entries: []pb.Entry{
-			{Index: 5, Term: 5},
-			{Index: 6, Term: 6},
-			{Index: 7, Term: 7},
-		},
 	}
+	im.resize()
+	im.entries = append(im.entries, []pb.Entry{
+		{Index: 5, Term: 5},
+		{Index: 6, Term: 6},
+		{Index: 7, Term: 7},
+	}...)
+	im.shrunk = shrunk
 	ents := []pb.Entry{
 		{Index: 8, Term: 8},
 		{Index: 9, Term: 9},
 	}
 	im.merge(ents)
+	if im.shrunk != shrunk {
+		t.Errorf("shrunk flag unexpectedly changed, %t:%t", im.shrunk, shrunk)
+	}
 	if len(im.entries) != 5 || im.markerIndex != 5 {
 		t.Errorf("not fully appended")
 	}
@@ -276,20 +285,30 @@ func TestInMemMergeFullAppend(t *testing.T) {
 	}
 }
 
+func TestInMemMergeFullAppend(t *testing.T) {
+	testInMemMergeFullAppend(t, false)
+	testInMemMergeFullAppend(t, true)
+}
+
 func TestInMemMergeReplace(t *testing.T) {
 	im := inMemory{
 		markerIndex: 5,
-		entries: []pb.Entry{
-			{Index: 5, Term: 5},
-			{Index: 6, Term: 6},
-			{Index: 7, Term: 7},
-		},
 	}
+	im.resize()
+	im.entries = append(im.entries, []pb.Entry{
+		{Index: 5, Term: 5},
+		{Index: 6, Term: 6},
+		{Index: 7, Term: 7},
+	}...)
+	im.shrunk = true
 	ents := []pb.Entry{
 		{Index: 2, Term: 2},
 		{Index: 3, Term: 3},
 	}
 	im.merge(ents)
+	if im.shrunk {
+		t.Errorf("shrunk flag unexpectedly not cleared")
+	}
 	if len(im.entries) != 2 || im.markerIndex != 2 {
 		t.Errorf("not fully appended")
 	}
@@ -323,17 +342,22 @@ func TestInMemMergeWithHoleCausePanic(t *testing.T) {
 func TestInMemMerge(t *testing.T) {
 	im := inMemory{
 		markerIndex: 5,
-		entries: []pb.Entry{
-			{Index: 5, Term: 5},
-			{Index: 6, Term: 6},
-			{Index: 7, Term: 7},
-		},
 	}
+	im.resize()
+	im.entries = append(im.entries, []pb.Entry{
+		{Index: 5, Term: 5},
+		{Index: 6, Term: 6},
+		{Index: 7, Term: 7},
+	}...)
+	im.shrunk = true
 	ents := []pb.Entry{
 		{Index: 6, Term: 7},
 		{Index: 7, Term: 10},
 	}
 	im.merge(ents)
+	if im.shrunk {
+		t.Errorf("shrunk flag unexpectedly not cleared")
+	}
 	if len(im.entries) != 3 || im.markerIndex != 5 {
 		t.Errorf("not fully appended")
 	}
@@ -511,7 +535,14 @@ func TestAppliedLogTo(t *testing.T) {
 		{10, 1, 10},
 	}
 	for idx, tt := range tests {
+		len1 := len(im.entries)
 		im.appliedLogTo(tt.appliedTo)
+		len2 := len(im.entries)
+		if len2 < len1 {
+			if !im.shrunk {
+				t.Errorf("shrunk flag not set")
+			}
+		}
 		if len(im.entries) != tt.length {
 			t.Errorf("%d, unexpected entry slice len %d, want %d",
 				idx, len(im.entries), tt.length)
@@ -562,7 +593,7 @@ func TestRateLimitIsUpdatedAfterMergingEntries(t *testing.T) {
 		{Index: 2, Cmd: make([]byte, 16)},
 		{Index: 3, Cmd: make([]byte, 64)},
 	}
-	addSz := getEntrySliceSize(ents)
+	addSz := getEntrySliceInMemSize(ents)
 	im.merge(ents)
 	if logsz+addSz != im.rl.Get() {
 		t.Errorf("log size %d, want %d", im.rl.Get(), logsz+addSz)
@@ -577,12 +608,12 @@ func TestRateLimitIsDecreasedAfterEntriesAreApplied(t *testing.T) {
 	}
 	im := newInMemory(2, server.NewRateLimiter(10000))
 	im.merge(ents)
-	if im.rl.Get() != getEntrySliceSize(ents) {
+	if im.rl.Get() != getEntrySliceInMemSize(ents) {
 		t.Errorf("unexpected log size")
 	}
 	for idx := uint64(2); idx < uint64(5); idx++ {
 		im.appliedLogTo(idx)
-		if im.rl.Get() != getEntrySliceSize(im.entries) {
+		if im.rl.Get() != getEntrySliceInMemSize(im.entries) {
 			t.Errorf("log size not updated")
 		}
 	}
@@ -600,7 +631,7 @@ func TestRateLimitCanBeResetWhenMergingEntries(t *testing.T) {
 		{Index: 1, Cmd: make([]byte, 16)},
 	}
 	im.merge(ents)
-	expSz := getEntrySliceSize(ents)
+	expSz := getEntrySliceInMemSize(ents)
 	if im.rl.Get() != expSz {
 		t.Errorf("log size %d, want %d", im.rl.Get(), expSz)
 	}
@@ -619,8 +650,50 @@ func TestRateLimitCanBeUpdatedAfterCutAndMergingEntries(t *testing.T) {
 		{Index: 4, Cmd: make([]byte, 1024)},
 	}
 	im.merge(ents)
-	expSz := getEntrySliceSize(im.entries)
+	expSz := getEntrySliceInMemSize(im.entries)
 	if im.rl.Get() != expSz {
 		t.Errorf("log size %d, want %d", im.rl.Get(), expSz)
+	}
+}
+
+func TestResize(t *testing.T) {
+	im := inMemory{
+		markerIndex: 10,
+		entries: []pb.Entry{
+			{Index: 10, Term: 1},
+			{Index: 11, Term: 1},
+		},
+		shrunk: true,
+	}
+	im.resize()
+	if uint64(cap(im.entries)) != entrySliceSize {
+		t.Errorf("not resized")
+	}
+	if len(im.entries) != 2 {
+		t.Errorf("unexpected len %d", len(im.entries))
+	}
+	if im.shrunk {
+		t.Errorf("shrunk flag not clearaed")
+	}
+}
+
+func TestTryResize(t *testing.T) {
+	im := inMemory{
+		markerIndex: 10,
+		entries: []pb.Entry{
+			{Index: 10, Term: 1},
+			{Index: 11, Term: 1},
+		},
+	}
+	initcap := cap(im.entries)
+	initlen := len(im.entries)
+	im.tryResize()
+	if cap(im.entries) != initcap || len(im.entries) != initlen {
+		t.Errorf("cap/len unexpectedly changed")
+	}
+	im.shrunk = true
+	im.tryResize()
+	if cap(im.entries) == initcap {
+		t.Errorf("cap/len unexpectedly not changed")
 	}
 }

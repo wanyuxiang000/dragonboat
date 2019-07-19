@@ -28,8 +28,7 @@ import (
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/internal/rsm"
-	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
+	"github.com/lni/goutils/random"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
@@ -200,10 +199,6 @@ func getDroppedResult() RequestResult {
 		code: requestDropped,
 	}
 }
-
-const (
-	maxProposalPayloadSize = settings.MaxProposalPayloadSize
-)
 
 type logicalClock struct {
 	ltick             uint64
@@ -379,11 +374,11 @@ type pendingConfigChange struct {
 type pendingSnapshot struct {
 	mu        sync.Mutex
 	pending   *RequestState
-	snapshotC chan<- rsm.SnapshotRequest
+	snapshotC chan<- rsm.SSRequest
 	logicalClock
 }
 
-func newPendingSnapshot(snapshotC chan<- rsm.SnapshotRequest,
+func newPendingSnapshot(snapshotC chan<- rsm.SSRequest,
 	tickInMillisecond uint64) *pendingSnapshot {
 	gcTick := defaultGCTick
 	if gcTick == 0 {
@@ -414,8 +409,9 @@ func (p *pendingSnapshot) close() {
 	}
 }
 
-func (p *pendingSnapshot) request(st rsm.SnapshotRequestType,
-	path string, timeout time.Duration) (*RequestState, error) {
+func (p *pendingSnapshot) request(st rsm.SSReqType,
+	path string, override bool, overhead uint64,
+	timeout time.Duration) (*RequestState, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	timeoutTick := p.getTimeoutTick(timeout)
@@ -428,10 +424,12 @@ func (p *pendingSnapshot) request(st rsm.SnapshotRequestType,
 	if p.snapshotC == nil {
 		return nil, ErrClusterClosed
 	}
-	ssreq := rsm.SnapshotRequest{
-		Type: st,
-		Path: path,
-		Key:  random.LockGuardedRand.Uint64(),
+	ssreq := rsm.SSRequest{
+		Type:               st,
+		Path:               path,
+		Key:                random.LockGuardedRand.Uint64(),
+		OverrideCompaction: override,
+		CompactionOverhead: overhead,
 	}
 	req := &RequestState{
 		key:        ssreq.Key,
@@ -929,9 +927,6 @@ func (p *proposalShard) propose(session *client.Session,
 	timeoutTick := p.getTimeoutTick(timeout)
 	if timeoutTick == 0 {
 		return nil, ErrTimeoutTooSmall
-	}
-	if uint64(len(cmd)) > maxProposalPayloadSize {
-		return nil, ErrPayloadTooBig
 	}
 	entry := pb.Entry{
 		Key:         key,

@@ -22,9 +22,9 @@ import (
 
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/tests/kvpb"
-	"github.com/lni/dragonboat/v3/internal/utils/leaktest"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
+	"github.com/lni/goutils/leaktest"
 )
 
 func TestManagedObjectCanBeAddedReturnedAndRemoved(t *testing.T) {
@@ -78,7 +78,10 @@ func TestStateMachineWrapperCanBeCreatedAndDestroyed(t *testing.T) {
 	if ds3 == nil {
 		t.Errorf("failed to return the on-disk data store object")
 	}
-	ds3.Open()
+	_, err := ds3.Open()
+	if err != nil {
+		t.Fatalf("open failed %v", err)
+	}
 	ds1.(*RegularStateMachineWrapper).SetOffloaded(rsm.FromNodeHost)
 	ds1.(*RegularStateMachineWrapper).SetOffloaded(rsm.FromStepWorker)
 	ds1.(*RegularStateMachineWrapper).SetOffloaded(rsm.FromCommitWorker)
@@ -127,7 +130,10 @@ func TestOffloadedWorksAsExpected(t *testing.T) {
 	if ds3 == nil {
 		t.Errorf("failed to return the on-disk data store object")
 	}
-	ds3.Open()
+	_, err := ds3.Open()
+	if err != nil {
+		t.Fatalf("open failed %v", err)
+	}
 	tests := []struct {
 		val       rsm.From
 		destroyed bool
@@ -171,7 +177,10 @@ func TestCppWrapperCanBeUpdatedAndLookedUp(t *testing.T) {
 		"CreateOnDiskStateMachine",
 		pb.OnDiskStateMachine, nil)
 	initialApplied := uint64(123)
-	ds3.Open()
+	_, err := ds3.Open()
+	if err != nil {
+		t.Fatalf("open failed %v", err)
+	}
 	if ds1 == nil {
 		t.Errorf("failed to return the data store object")
 	}
@@ -245,7 +254,10 @@ func TestCppWrapperCanBeBatchedUpdatedAndLookedUp(t *testing.T) {
 		"CreateOnDiskStateMachine",
 		pb.OnDiskStateMachine, nil)
 	initialApplied := uint64(123)
-	ds3.Open()
+	_, err := ds3.Open()
+	if err != nil {
+		t.Fatalf("open failed %v", err)
+	}
 	if ds2 == nil {
 		t.Errorf("failed to return the concurrent data store object")
 	}
@@ -339,12 +351,13 @@ func TestCppWrapperSnapshotWorks(t *testing.T) {
 	if v2.Value != v1.Value+1 || v3.Value != v2.Value+1 {
 		t.Errorf("Unexpected update result")
 	}
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp,
+		rsm.SnapshotVersion, pb.NoCompression)
 	if err != nil {
 		t.Fatalf("failed to create snapshot writer %v", err)
 	}
 	sessions := bytes.NewBuffer(make([]byte, 0, 1024*1024))
-	_, sz, err := ds.SaveSnapshot(nil, writer, sessions.Bytes(), nil)
+	_, err = ds.SaveSnapshot(nil, writer, sessions.Bytes(), nil)
 	if err != nil {
 		t.Errorf("failed to save snapshot, %v", err)
 	}
@@ -356,13 +369,6 @@ func TestCppWrapperSnapshotWorks(t *testing.T) {
 		t.Errorf("failed to open file %v", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		t.Errorf("failed to get file stat")
-	}
-	if uint64(fi.Size()) != sz {
-		t.Errorf("sz %d, want %d", fi.Size(), sz)
-	}
 	ds2 := NewStateMachineWrapperFromPlugin(1, 1,
 		"./dragonboat-cpp-plugin-example.so",
 		"CreateRegularStateMachine",
@@ -382,7 +388,6 @@ func TestCppWrapperSnapshotWorks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
-	reader.ValidateHeader(header)
 	err = ds2.RecoverFromSnapshot(reader, nil)
 	if err != nil {
 		t.Errorf("failed to recover from snapshot %v", err)
@@ -413,18 +418,18 @@ func TestRegularSMCanRecoverFromExportedSnapshot(t *testing.T) {
 	if count.Value != 1 {
 		t.Fatalf("initial update returned %v, want 1", count.Value)
 	}
-	meta := rsm.SnapshotMeta{
-		Request: rsm.SnapshotRequest{
+	meta := rsm.SSMeta{
+		Request: rsm.SSRequest{
 			Type: rsm.ExportedSnapshot,
 		},
 		Type:    pb.RegularStateMachine,
 		Session: bytes.NewBuffer(make([]byte, 0, 1024*1024)),
 	}
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp, rsm.SnapshotVersion, pb.NoCompression)
 	if err != nil {
 		t.Fatalf("failed to new snapshot writer %v", err)
 	}
-	_, sz, err := ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
+	_, err = ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
 	if err != nil {
 		t.Errorf("failed to save snapshot, %v", err)
 	}
@@ -436,13 +441,6 @@ func TestRegularSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Errorf("failed to open file %v", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		t.Errorf("failed to get file stat")
-	}
-	if uint64(fi.Size()) != sz {
-		t.Errorf("sz %d, want %d", fi.Size(), sz)
-	}
 	ds2 := NewStateMachineWrapperFromPlugin(1, 1,
 		"./dragonboat-cpp-plugin-example.so",
 		"CreateRegularStateMachine",
@@ -456,11 +454,10 @@ func TestRegularSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Fatalf("failed to new snapshot reader %v", err)
 	}
 	defer reader.Close()
-	header, err := reader.GetHeader()
+	_, err = reader.GetHeader()
 	if err != nil {
 		t.Fatalf("failed to get snapshot header")
 	}
-	reader.ValidateHeader(header)
 	err = ds2.RecoverFromSnapshot(reader, nil)
 	if err != nil {
 		t.Fatalf("failed to recover from snapshot %v", err)
@@ -498,19 +495,19 @@ func TestConcurrentSMCanRecoverFromExportedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to prepare snapshot: %v", err)
 	}
-	meta := rsm.SnapshotMeta{
-		Request: rsm.SnapshotRequest{
+	meta := rsm.SSMeta{
+		Request: rsm.SSRequest{
 			Type: rsm.ExportedSnapshot,
 		},
 		Type:    pb.ConcurrentStateMachine,
 		Session: bytes.NewBuffer(make([]byte, 0, 1024*1024)),
 		Ctx:     ctx,
 	}
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp, rsm.SnapshotVersion, pb.NoCompression)
 	if err != nil {
 		t.Fatalf("failed to new snapshot writer %v", err)
 	}
-	_, sz, err := ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
+	_, err = ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
 	if err != nil {
 		t.Errorf("failed to save snapshot, %v", err)
 	}
@@ -522,13 +519,6 @@ func TestConcurrentSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Errorf("failed to open file %v", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		t.Errorf("failed to get file stat")
-	}
-	if uint64(fi.Size()) != sz {
-		t.Errorf("sz %d, want %d", fi.Size(), sz)
-	}
 	ds2 := NewStateMachineWrapperFromPlugin(1, 1,
 		"./dragonboat-cpp-plugin-example.so",
 		"CreateConcurrentStateMachine",
@@ -542,11 +532,10 @@ func TestConcurrentSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Fatalf("failed to new snapshot reader %v", err)
 	}
 	defer reader.Close()
-	header, err := reader.GetHeader()
+	_, err = reader.GetHeader()
 	if err != nil {
 		t.Fatalf("failed to get snapshot header")
 	}
-	reader.ValidateHeader(header)
 	err = ds2.RecoverFromSnapshot(reader, nil)
 	if err != nil {
 		t.Fatalf("failed to recover from snapshot %v", err)
@@ -690,19 +679,19 @@ func TestOnDiskSMCanRecoverFromExportedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to prepare snapshot: %v", err)
 	}
-	meta := rsm.SnapshotMeta{
-		Request: rsm.SnapshotRequest{
+	meta := rsm.SSMeta{
+		Request: rsm.SSRequest{
 			Type: rsm.ExportedSnapshot,
 		},
 		Type:    pb.OnDiskStateMachine,
 		Session: bytes.NewBuffer(make([]byte, 0, 1024*1024)),
 		Ctx:     ctx,
 	}
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp, rsm.SnapshotVersion, pb.NoCompression)
 	if err != nil {
 		t.Fatalf("failed to new snapshot writer %v", err)
 	}
-	_, sz, err := ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
+	_, err = ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
 	if err != nil {
 		t.Errorf("failed to save snapshot, %v", err)
 	}
@@ -714,13 +703,6 @@ func TestOnDiskSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Errorf("failed to open file %v", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		t.Errorf("failed to get file stat")
-	}
-	if uint64(fi.Size()) != sz {
-		t.Errorf("sz %d, want %d", fi.Size(), sz)
-	}
 	ds2 := NewStateMachineWrapperFromPlugin(1, 1,
 		"./dragonboat-cpp-plugin-example.so",
 		"CreateOnDiskStateMachine",
@@ -738,11 +720,10 @@ func TestOnDiskSMCanRecoverFromExportedSnapshot(t *testing.T) {
 		t.Fatalf("failed to new snapshot reader %v", err)
 	}
 	defer reader.Close()
-	header, err := reader.GetHeader()
+	_, err = reader.GetHeader()
 	if err != nil {
 		t.Fatalf("failed to get snapshot header")
 	}
-	reader.ValidateHeader(header)
 	err = ds2.RecoverFromSnapshot(reader, nil)
 	if err != nil {
 		t.Fatalf("failed to recover from snapshot %v", err)
@@ -775,19 +756,19 @@ func TestOnDiskSMCanSaveDummySnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to prepare snapshot: %v", err)
 	}
-	meta := rsm.SnapshotMeta{
-		Request: rsm.SnapshotRequest{
+	meta := rsm.SSMeta{
+		Request: rsm.SSRequest{
 			Type: rsm.UserRequestedSnapshot,
 		},
 		Type:    pb.OnDiskStateMachine,
 		Session: bytes.NewBuffer(make([]byte, 0, 1024*1024)),
 		Ctx:     ctx,
 	}
-	writer, err := rsm.NewSnapshotWriter(fp, rsm.CurrentSnapshotVersion)
+	writer, err := rsm.NewSnapshotWriter(fp, rsm.SnapshotVersion, pb.NoCompression)
 	if err != nil {
 		t.Fatalf("failed to new snapshot writer %v", err)
 	}
-	_, _, err = ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
+	_, err = ds1.SaveSnapshot(&meta, writer, meta.Session.Bytes(), nil)
 	if err != nil {
 		t.Errorf("failed to save snapshot, %v", err)
 	}
@@ -799,11 +780,10 @@ func TestOnDiskSMCanSaveDummySnapshot(t *testing.T) {
 		t.Fatalf("failed to new snapshot reader %v", err)
 	}
 	defer reader.Close()
-	header, err := reader.GetHeader()
+	_, err = reader.GetHeader()
 	if err != nil {
 		t.Fatalf("failed to get snapshot header")
 	}
-	reader.ValidateHeader(header)
 }
 
 type testSink struct {
@@ -856,8 +836,8 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to prepare snapshot: %v", err)
 	}
-	meta := rsm.SnapshotMeta{
-		Request: rsm.SnapshotRequest{
+	meta := rsm.SSMeta{
+		Request: rsm.SSRequest{
 			Type: rsm.ExportedSnapshot,
 		},
 		Type:    pb.OnDiskStateMachine,
@@ -869,6 +849,7 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 		sendFailed: false,
 		stopped:    false,
 	}
+	emptySession := rsm.GetEmptyLRUSession()
 	writer := rsm.NewChunkWriter(&sink, &meta)
 	err = ds1.StreamSnapshot(ctx, writer)
 	if err != nil {
@@ -884,28 +865,36 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 		t.Errorf("failed to create temp snapshot file")
 	}
 	for _, chunk := range sink.chunks {
-		f.Write(chunk.Data)
+		_, err := f.Write(chunk.Data)
+		if err != nil {
+			t.Fatalf("open failed %v", err)
+		}
 	}
 	f.Close()
-	f, _ = os.Open(fp)
+	_, err = os.Open(fp)
+	if err != nil {
+		t.Fatalf("open failed %v", err)
+	}
 	reader, err := rsm.NewSnapshotReader(fp)
 	if err != nil {
 		t.Fatalf("failed to new snapshot reader %v", err)
 	}
 	defer reader.Close()
-	header, err := reader.GetHeader()
+	_, err = reader.GetHeader()
 	if err != nil {
 		t.Fatalf("failed to get snapshot header")
 	}
-	reader.ValidateHeader(header)
 	buf := make([]byte, 16)
 	// the snapshot header is followed by extra 16 bytes for sessions
 	// the first 8 bytes indicate that there are at most 4096 struct session
 	// the next 8 bytes indicate the actual number of struct session
 	// because on-disk-sm does not support sessions, the 16 extra bytes
 	// in streamed snapshot are just used as place holders
-	reader.Read(buf)
-	if binary.LittleEndian.Uint64(buf[0:8]) != 4096 || binary.LittleEndian.Uint64(buf[8:]) != 0 {
+	_, err = reader.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed %v", err)
+	}
+	if !bytes.Equal(buf, emptySession) {
 		t.Errorf("sessions not empty")
 	}
 	ds2 := NewStateMachineWrapperFromPlugin(1, 1,

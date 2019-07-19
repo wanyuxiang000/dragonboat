@@ -33,10 +33,10 @@ import (
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/transport"
-	"github.com/lni/dragonboat/v3/internal/utils/fileutil"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
+	"github.com/lni/goutils/fileutil"
 )
 
 var (
@@ -192,7 +192,7 @@ func ImportSnapshot(nhConfig config.NodeHostConfig,
 	getSnapshotDir := func(cid uint64, nid uint64) string {
 		return serverCtx.GetSnapshotDir(nhConfig.DeploymentID, cid, nid)
 	}
-	env := server.NewSnapshotEnv(getSnapshotDir,
+	env := server.NewSSEnv(getSnapshotDir,
 		oldss.ClusterId, nodeID, oldss.Index, nodeID, server.SnapshottingMode)
 	if err := env.CreateTempDir(); err != nil {
 		return err

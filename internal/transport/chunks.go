@@ -25,8 +25,8 @@ import (
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/fileutil"
-	"github.com/lni/dragonboat/v3/internal/utils/logutil"
+	"github.com/lni/goutils/fileutil"
+	"github.com/lni/goutils/logutil"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
@@ -281,13 +281,13 @@ func (c *Chunks) addChunk(chunk pb.SnapshotChunk) bool {
 }
 
 func (c *Chunks) nodeRemoved(chunk pb.SnapshotChunk) (bool, error) {
-	env := c.getSnapshotEnv(chunk)
+	env := c.getSSEnv(chunk)
 	dir := env.GetRootDir()
 	return fileutil.IsDirMarkedAsDeleted(dir)
 }
 
 func (c *Chunks) saveChunk(chunk pb.SnapshotChunk) error {
-	env := c.getSnapshotEnv(chunk)
+	env := c.getSSEnv(chunk)
 	if chunk.ChunkId == 0 {
 		if err := env.CreateTempDir(); err != nil {
 			return err
@@ -321,14 +321,14 @@ func (c *Chunks) saveChunk(chunk pb.SnapshotChunk) error {
 	return nil
 }
 
-func (c *Chunks) getSnapshotEnv(chunk pb.SnapshotChunk) *server.SnapshotEnv {
-	return server.NewSnapshotEnv(c.getSnapshotDir,
+func (c *Chunks) getSSEnv(chunk pb.SnapshotChunk) *server.SSEnv {
+	return server.NewSSEnv(c.getSnapshotDir,
 		chunk.ClusterId, chunk.NodeId, chunk.Index, chunk.From,
 		server.ReceivingMode)
 }
 
 func (c *Chunks) finalizeSnapshot(chunk pb.SnapshotChunk, td *tracked) error {
-	env := c.getSnapshotEnv(chunk)
+	env := c.getSSEnv(chunk)
 	msg := c.toMessage(td.firstChunk, td.extraFiles)
 	if len(msg.Requests) != 1 || msg.Requests[0].Type != pb.InstallSnapshot {
 		panic("invalid message")
@@ -342,7 +342,7 @@ func (c *Chunks) finalizeSnapshot(chunk pb.SnapshotChunk, td *tracked) error {
 }
 
 func (c *Chunks) deleteTempChunkDir(chunk pb.SnapshotChunk) {
-	env := c.getSnapshotEnv(chunk)
+	env := c.getSSEnv(chunk)
 	env.MustRemoveTempDir()
 }
 
@@ -351,7 +351,7 @@ func (c *Chunks) toMessage(chunk pb.SnapshotChunk,
 	if chunk.ChunkId != 0 {
 		panic("first chunk must be used to reconstruct the snapshot")
 	}
-	env := c.getSnapshotEnv(chunk)
+	env := c.getSSEnv(chunk)
 	snapDir := env.GetFinalDir()
 	m := pb.Message{}
 	m.Type = pb.InstallSnapshot

@@ -40,18 +40,18 @@ import (
 	"github.com/lni/dragonboat/v3/internal/logdb"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
-	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/tests"
 	"github.com/lni/dragonboat/v3/internal/transport"
-	"github.com/lni/dragonboat/v3/internal/utils/fileutil"
-	"github.com/lni/dragonboat/v3/internal/utils/leaktest"
-	"github.com/lni/dragonboat/v3/internal/utils/syncutil"
 	"github.com/lni/dragonboat/v3/plugin/leveldb"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 	"github.com/lni/dragonboat/v3/tools"
 	"github.com/lni/dragonboat/v3/tools/upgrade310"
+	"github.com/lni/goutils/fileutil"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/goutils/random"
+	"github.com/lni/goutils/syncutil"
 )
 
 var ovs = logdb.RDBContextValueSize
@@ -283,6 +283,39 @@ func (n *PST) GetHash() (uint64, error) {
 	return 0, nil
 }
 
+func createSnapshotCompressedTestNodeHost(addr string,
+	datadir string) (*NodeHost, error) {
+	rc := config.Config{
+		NodeID:                  1,
+		ClusterID:               1,
+		ElectionRTT:             5,
+		HeartbeatRTT:            1,
+		CheckQuorum:             true,
+		SnapshotEntries:         10,
+		CompactionOverhead:      5,
+		SnapshotCompressionType: config.Snappy,
+	}
+	peers := make(map[uint64]string)
+	peers[1] = addr
+	nhc := config.NodeHostConfig{
+		WALDir:         datadir,
+		NodeHostDir:    datadir,
+		RTTMillisecond: 100,
+		RaftAddress:    peers[1],
+	}
+	nh, err := NewNodeHost(nhc)
+	if err != nil {
+		return nil, err
+	}
+	newSM := func(clusterID uint64, nodeID uint64) sm.IStateMachine {
+		return &tests.VerboseSnapshotSM{}
+	}
+	if err := nh.StartCluster(peers, false, newSM, rc); err != nil {
+		return nil, err
+	}
+	return nh, nil
+}
+
 func createSingleNodeTestNodeHost(addr string,
 	datadir string, slowSave bool) (*NodeHost, *PST, error) {
 	// config for raft
@@ -375,7 +408,7 @@ func createConcurrentTestNodeHost(addr string,
 
 func createFakeDiskTestNodeHost(addr string,
 	datadir string, initialApplied uint64,
-	slowOpen bool) (*NodeHost, sm.IOnDiskStateMachine, error) {
+	slowOpen bool, compressed bool) (*NodeHost, sm.IOnDiskStateMachine, error) {
 	rc := config.Config{
 		ClusterID:          uint64(1),
 		NodeID:             uint64(1),
@@ -384,6 +417,9 @@ func createFakeDiskTestNodeHost(addr string,
 		CheckQuorum:        true,
 		SnapshotEntries:    30,
 		CompactionOverhead: 30,
+	}
+	if compressed {
+		rc.SnapshotCompressionType = config.Snappy
 	}
 	peers := make(map[uint64]string)
 	peers[1] = addr
@@ -410,6 +446,26 @@ func createFakeDiskTestNodeHost(addr string,
 	return nh, fakeDiskSM, nil
 }
 
+func snapshotCompressedTest(t *testing.T, tf func(t *testing.T, nh *NodeHost)) {
+	logdb.RDBContextValueSize = 1024 * 1024
+	defer func() {
+		logdb.RDBContextValueSize = ovs
+	}()
+	defer leaktest.AfterTest(t)()
+	os.RemoveAll(singleNodeHostTestDir)
+	nh, err := createSnapshotCompressedTestNodeHost(singleNodeHostTestAddr,
+		singleNodeHostTestDir)
+	if err != nil {
+		t.Fatalf("failed to create nodehost %v", err)
+	}
+	defer os.RemoveAll(singleNodeHostTestDir)
+	defer func() {
+		nh.Stop()
+	}()
+	waitForLeaderToBeElected(t, nh, 1)
+	tf(t, nh)
+}
+
 func singleConcurrentNodeHostTest(t *testing.T,
 	tf func(t *testing.T, nh *NodeHost), snapshotEntry uint64, concurrent bool) {
 	logdb.RDBContextValueSize = 1024 * 1024
@@ -433,7 +489,8 @@ func singleConcurrentNodeHostTest(t *testing.T,
 }
 
 func singleFakeDiskNodeHostTest(t *testing.T,
-	tf func(t *testing.T, nh *NodeHost, initialApplied uint64), initialApplied uint64) {
+	tf func(t *testing.T, nh *NodeHost, initialApplied uint64),
+	initialApplied uint64, compressed bool) {
 	logdb.RDBContextValueSize = 1024 * 1024
 	defer func() {
 		logdb.RDBContextValueSize = ovs
@@ -441,7 +498,7 @@ func singleFakeDiskNodeHostTest(t *testing.T,
 	defer leaktest.AfterTest(t)()
 	os.RemoveAll(singleNodeHostTestDir)
 	nh, _, err := createFakeDiskTestNodeHost(singleNodeHostTestAddr,
-		singleNodeHostTestDir, initialApplied, false)
+		singleNodeHostTestDir, initialApplied, false, compressed)
 	if err != nil {
 		t.Fatalf("failed to create nodehost %v", err)
 	}
@@ -454,7 +511,8 @@ func singleFakeDiskNodeHostTest(t *testing.T,
 }
 
 func twoFakeDiskNodeHostTest(t *testing.T,
-	tf func(t *testing.T, nh1 *NodeHost, nh2 *NodeHost)) {
+	tf func(t *testing.T, nh1 *NodeHost, nh2 *NodeHost),
+	ct config.CompressionType) {
 	logdb.RDBContextValueSize = 1024 * 1024
 	defer func() {
 		logdb.RDBContextValueSize = ovs
@@ -464,7 +522,7 @@ func twoFakeDiskNodeHostTest(t *testing.T,
 	nh2dir := path.Join(singleNodeHostTestDir, "nh2")
 	os.RemoveAll(singleNodeHostTestDir)
 	nh1, nh2, err := createFakeDiskTwoTestNodeHosts(nodeHostTestAddr1,
-		nodeHostTestAddr2, nh1dir, nh2dir)
+		nodeHostTestAddr2, nh1dir, nh2dir, ct)
 	if err != nil {
 		t.Fatalf("failed to create nodehost %v", err)
 	}
@@ -478,15 +536,17 @@ func twoFakeDiskNodeHostTest(t *testing.T,
 }
 
 func createFakeDiskTwoTestNodeHosts(addr1 string, addr2 string,
-	datadir1 string, datadir2 string) (*NodeHost, *NodeHost, error) {
+	datadir1 string, datadir2 string,
+	ct config.CompressionType) (*NodeHost, *NodeHost, error) {
 	rc := config.Config{
-		ClusterID:          1,
-		NodeID:             1,
-		ElectionRTT:        3,
-		HeartbeatRTT:       1,
-		CheckQuorum:        true,
-		SnapshotEntries:    5,
-		CompactionOverhead: 2,
+		ClusterID:               1,
+		NodeID:                  1,
+		ElectionRTT:             3,
+		HeartbeatRTT:            1,
+		CheckQuorum:             true,
+		SnapshotEntries:         5,
+		CompactionOverhead:      2,
+		SnapshotCompressionType: ct,
 	}
 	peers := make(map[uint64]string)
 	peers[1] = addr1
@@ -546,11 +606,6 @@ func createRateLimitedTestNodeHost(addr string,
 	newRSM := func(clusterID uint64, nodeID uint64) sm.IStateMachine {
 		return &tests.NoOP{MillisecondToSleep: 20}
 	}
-	oldv := settings.Soft.ExpectedMaxInMemLogSize
-	settings.Soft.ExpectedMaxInMemLogSize = 3 * 1024
-	defer func() {
-		settings.Soft.ExpectedMaxInMemLogSize = oldv
-	}()
 	if err := nh.StartCluster(peers, false, newRSM, rc); err != nil {
 		return nil, err
 	}
@@ -598,11 +653,6 @@ func createRateLimitedTwoTestNodeHosts(addr1 string, addr2 string,
 	newRSM2 := func(clusterID uint64, nodeID uint64) sm.IStateMachine {
 		return sm2
 	}
-	oldv := settings.Soft.ExpectedMaxInMemLogSize
-	settings.Soft.ExpectedMaxInMemLogSize = 3 * 1024
-	defer func() {
-		settings.Soft.ExpectedMaxInMemLogSize = oldv
-	}()
 	rc.NodeID = 1
 	if err := nh1.StartCluster(peers, false, newRSM1, rc); err != nil {
 		return nil, nil, err
@@ -1370,13 +1420,13 @@ func TestOnDiskStateMachineDoesNotSupportClientSession(t *testing.T) {
 			t.Fatalf("failed to get new session")
 		}
 	}
-	singleFakeDiskNodeHostTest(t, tf, 0)
+	singleFakeDiskNodeHostTest(t, tf, 0, false)
 }
 
 func TestStaleReadOnUninitializedNodeReturnError(t *testing.T) {
 	tf := func() {
 		nh, fakeDiskSM, err := createFakeDiskTestNodeHost(singleNodeHostTestAddr,
-			singleNodeHostTestDir, 0, true)
+			singleNodeHostTestDir, 0, true, false)
 		if err != nil {
 			t.Fatalf("failed to create nodehost %v", err)
 		}
@@ -1409,7 +1459,7 @@ func TestStaleReadOnUninitializedNodeReturnError(t *testing.T) {
 	runNodeHostTest(t, tf)
 }
 
-func TestOnDiskStateMachineCanTakeDummySnapshot(t *testing.T) {
+func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool) {
 	tf := func(t *testing.T, nh *NodeHost, initialApplied uint64) {
 		session := nh.GetNoOPSession(1)
 		logdb := nh.logdb
@@ -1453,11 +1503,14 @@ func TestOnDiskStateMachineCanTakeDummySnapshot(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to get header")
 		}
-		if h.Version != uint64(rsm.CurrentSnapshotVersion) {
-			t.Errorf("unexpected snapshot version, got %d, want %d",
-				h.Version, rsm.CurrentSnapshotVersion)
+		// dummy snapshot is always not compressed
+		if h.CompressionType != config.NoCompression {
+			t.Errorf("dummy snapshot compressed")
 		}
-		reader.ValidateHeader(h)
+		if h.Version != uint64(rsm.SnapshotVersion) {
+			t.Errorf("unexpected snapshot version, got %d, want %d",
+				h.Version, rsm.SnapshotVersion)
+		}
 		reader.Close()
 		shrunk, err := rsm.IsShrinkedSnapshotFile(ss.Filepath)
 		if err != nil {
@@ -1467,7 +1520,12 @@ func TestOnDiskStateMachineCanTakeDummySnapshot(t *testing.T) {
 			t.Errorf("not a dummy snapshot")
 		}
 	}
-	singleFakeDiskNodeHostTest(t, tf, 0)
+	singleFakeDiskNodeHostTest(t, tf, 0, compressed)
+}
+
+func TestOnDiskStateMachineCanTakeDummySnapshot(t *testing.T) {
+	testOnDiskStateMachineCanTakeDummySnapshot(t, true)
+	testOnDiskStateMachineCanTakeDummySnapshot(t, false)
 }
 
 func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
@@ -1545,7 +1603,7 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 						t.Errorf("failed to check whether snapshot is shrunk %v", err)
 					}
 					if !shrunk {
-						t.Errorf("failed to shrink snapshot")
+						t.Errorf("snapshot %d is not shrunk", ss.Index)
 					}
 				}
 				break
@@ -1556,7 +1614,8 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 		}
 
 	}
-	twoFakeDiskNodeHostTest(t, tf)
+	// twoFakeDiskNodeHostTest(t, tf, config.NoCompression)
+	twoFakeDiskNodeHostTest(t, tf, config.Snappy)
 }
 
 func TestConcurrentStateMachineLookup(t *testing.T) {
@@ -1571,8 +1630,10 @@ func TestConcurrentStateMachineLookup(t *testing.T) {
 				session := nh.GetNoOPSession(clusterID)
 				_, err := nh.SyncPropose(ctx, session, []byte("test"))
 				if err != nil {
+					plog.Infof("write failed %v", err)
 					t.Fatalf("failed to make proposal %v", err)
 				}
+				plog.Infof("write completed")
 				cancel()
 				if atomic.LoadUint32(&count) > 0 {
 					return
@@ -1581,9 +1642,17 @@ func TestConcurrentStateMachineLookup(t *testing.T) {
 		})
 		stopper.RunWorker(func() {
 			for i := 0; i < 10000; i++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-				result, err := nh.SyncRead(ctx, clusterID, []byte("test"))
-				cancel()
+				rs, err := nh.ReadIndex(clusterID, 200*time.Millisecond)
+				if err != nil {
+					continue
+				}
+				s := <-rs.CompletedC
+				if !s.Completed() {
+					continue
+				}
+				st := random.LockGuardedRand.Uint64()%7 + 1
+				time.Sleep(time.Duration(st) * time.Millisecond)
+				result, err := nh.ReadLocalNode(rs, []byte("test"))
 				if err != nil {
 					continue
 				}
@@ -1869,7 +1938,7 @@ func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
 		}
 		t.Errorf("failed to get is observer flag")
 	}
-	twoFakeDiskNodeHostTest(t, tf)
+	twoFakeDiskNodeHostTest(t, tf, config.NoCompression)
 }
 
 func TestSnapshotIndexWillPanicOnRegularRequestResult(t *testing.T) {
@@ -1956,6 +2025,61 @@ func TestSnapshotCanBeExportedAfterSnapshotting(t *testing.T) {
 	singleNodeHostTest(t, tf)
 }
 
+func TestCanOverrideSnapshotOverhead(t *testing.T) {
+	tf := func(t *testing.T, nh *NodeHost) {
+		session := nh.GetNoOPSession(2)
+		cmd := make([]byte, 1)
+		for i := 0; i < 16; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			_, err := nh.SyncPropose(ctx, session, cmd)
+			cancel()
+			if err != nil {
+				t.Fatalf("failed to make proposal %v", err)
+			}
+		}
+		opt := SnapshotOption{
+			OverrideCompactionOverhead: true,
+			CompactionOverhead:         0,
+		}
+		sr, err := nh.RequestSnapshot(2, opt, 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to request snapshot")
+		}
+		v := <-sr.CompletedC
+		if !v.Completed() {
+			t.Errorf("failed to complete the requested snapshot")
+		}
+		if v.SnapshotIndex() < 16 {
+			t.Fatalf("unexpected snapshot index %d", v.SnapshotIndex())
+		}
+		logdb := nh.logdb
+		for i := 0; i < 1000; i++ {
+			if i == 999 {
+				t.Fatalf("failed to compact the entries")
+			}
+			time.Sleep(10 * time.Millisecond)
+			// make sure the exec engine is stepping the node
+			// this is not required when not running single node test
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			_, err := nh.SyncPropose(ctx, session, cmd)
+			cancel()
+			if err != nil {
+				t.Fatalf("failed to make proposal %v", err)
+			}
+			ents, _, err := logdb.IterateEntries(nil, 0, 2, 1, 12, 14, math.MaxUint64)
+			if err != nil {
+				t.Fatalf("failed to iterate entries, %v", err)
+			}
+			if len(ents) != 0 {
+				continue
+			} else {
+				return
+			}
+		}
+	}
+	singleNodeHostTest(t, tf)
+}
+
 func TestSnapshotCanBeRequested(t *testing.T) {
 	tf := func(t *testing.T, nh *NodeHost) {
 		session := nh.GetNoOPSession(2)
@@ -2005,7 +2129,7 @@ func TestSnapshotCanBeRequested(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to get header %v", err)
 		}
-		if rsm.SnapshotVersion(header.Version) != rsm.V2SnapshotVersion {
+		if rsm.SSVersion(header.Version) != rsm.V2SnapshotVersion {
 			t.Errorf("unexpected snapshot version")
 		}
 	}
@@ -2388,19 +2512,21 @@ func TestOnDiskStateMachineCanExportSnapshot(t *testing.T) {
 			t.Errorf("incorrect type")
 		}
 	}
-	singleFakeDiskNodeHostTest(t, tf, 0)
+	singleFakeDiskNodeHostTest(t, tf, 0, false)
 }
 
-func testImportedSnapshotIsAlwaysRestored(t *testing.T, newDir bool) {
+func testImportedSnapshotIsAlwaysRestored(t *testing.T,
+	newDir bool, ct config.CompressionType) {
 	tf := func() {
 		rc := config.Config{
-			ClusterID:          1,
-			NodeID:             1,
-			ElectionRTT:        3,
-			HeartbeatRTT:       1,
-			CheckQuorum:        true,
-			SnapshotEntries:    5,
-			CompactionOverhead: 2,
+			ClusterID:               1,
+			NodeID:                  1,
+			ElectionRTT:             3,
+			HeartbeatRTT:            1,
+			CheckQuorum:             true,
+			SnapshotEntries:         5,
+			CompactionOverhead:      2,
+			SnapshotCompressionType: ct,
 		}
 		peers := make(map[uint64]string)
 		peers[1] = nodeHostTestAddr1
@@ -2532,8 +2658,9 @@ func testImportedSnapshotIsAlwaysRestored(t *testing.T, newDir bool) {
 }
 
 func TestImportedSnapshotIsAlwaysRestored(t *testing.T) {
-	testImportedSnapshotIsAlwaysRestored(t, true)
-	testImportedSnapshotIsAlwaysRestored(t, false)
+	testImportedSnapshotIsAlwaysRestored(t, true, config.NoCompression)
+	testImportedSnapshotIsAlwaysRestored(t, false, config.NoCompression)
+	testImportedSnapshotIsAlwaysRestored(t, false, config.Snappy)
 }
 
 func TestClusterWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
@@ -2741,8 +2868,8 @@ type chunkReceiver interface {
 	AddChunk(chunk pb.SnapshotChunk) bool
 }
 
-func getTestSnapshotMeta() *rsm.SnapshotMeta {
-	return &rsm.SnapshotMeta{
+func getTestSSMeta() *rsm.SSMeta {
+	return &rsm.SSMeta{
 		Index: 1000,
 		Term:  5,
 		From:  150,
@@ -2759,7 +2886,7 @@ func testCorruptedChunkWriterOutputCanBeHandledByChunks(t *testing.T,
 	cks := transport.NewSnapshotChunks(c.onReceive,
 		c.confirm, c.getDeploymentID, c.getSnapshotDirFunc)
 	sink := &dataCorruptionSink{receiver: cks, enabled: enabled}
-	meta := getTestSnapshotMeta()
+	meta := getTestSSMeta()
 	cw := rsm.NewChunkWriter(sink, meta)
 	defer os.RemoveAll(testSnapshotDir)
 	for i := 0; i < 10; i++ {
@@ -2794,8 +2921,11 @@ func TestChunkWriterOutputCanBeHandledByChunks(t *testing.T) {
 	cks := transport.NewSnapshotChunks(c.onReceive,
 		c.confirm, c.getDeploymentID, c.getSnapshotDirFunc)
 	sink := &testSink2{receiver: cks}
-	meta := getTestSnapshotMeta()
+	meta := getTestSSMeta()
 	cw := rsm.NewChunkWriter(sink, meta)
+	if _, err := cw.Write(rsm.GetEmptyLRUSession()); err != nil {
+		t.Fatalf("write failed %v", err)
+	}
 	defer os.RemoveAll(testSnapshotDir)
 	payload := make([]byte, 0)
 	payload = append(payload, rsm.GetEmptyLRUSession()...)
@@ -3209,12 +3339,22 @@ func TestDroppedRequestsAreReported(t *testing.T) {
 }
 
 type testRaftEventListener struct {
+	mu       sync.Mutex
 	received []raftio.LeaderInfo
 }
 
 func (rel *testRaftEventListener) LeaderUpdated(info raftio.LeaderInfo) {
+	rel.mu.Lock()
+	defer rel.mu.Unlock()
 	plog.Infof("leader info: %+v", info)
 	rel.received = append(rel.received, info)
+}
+
+func (rel *testRaftEventListener) get() []raftio.LeaderInfo {
+	rel.mu.Lock()
+	defer rel.mu.Unlock()
+	r := make([]raftio.LeaderInfo, 0)
+	return append(r, rel.received...)
 }
 
 func TestRaftEventsAreReported(t *testing.T) {
@@ -3262,8 +3402,10 @@ func TestRaftEventsAreReported(t *testing.T) {
 		t.Fatalf("add node failed %v", err)
 	}
 	cancel()
+	var received []raftio.LeaderInfo
 	for i := 0; i < 1000; i++ {
-		if len(rel.received) >= 4 {
+		received = rel.get()
+		if len(received) >= 4 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -3274,13 +3416,13 @@ func TestRaftEventsAreReported(t *testing.T) {
 	exp0 := raftio.LeaderInfo{
 		ClusterID: 1,
 		NodeID:    1,
-		LeaderID:  0,
+		LeaderID:  raftio.NoLeader,
 		Term:      1,
 	}
 	exp1 := raftio.LeaderInfo{
 		ClusterID: 1,
 		NodeID:    1,
-		LeaderID:  0,
+		LeaderID:  raftio.NoLeader,
 		Term:      2,
 	}
 	exp2 := raftio.LeaderInfo{
@@ -3297,9 +3439,9 @@ func TestRaftEventsAreReported(t *testing.T) {
 	}
 	expected := []raftio.LeaderInfo{exp0, exp1, exp2, exp3}
 	for idx := range expected {
-		if !reflect.DeepEqual(&(rel.received[idx]), &expected[idx]) {
+		if !reflect.DeepEqual(&(received[idx]), &expected[idx]) {
 			t.Errorf("unexpecded leader info, %d, %v, %v",
-				idx, rel.received[idx], expected[idx])
+				idx, received[idx], expected[idx])
 		}
 	}
 }
@@ -3353,4 +3495,31 @@ func TestV2DataCanBeHandled(t *testing.T) {
 	if rs.EntryCount != 3 || rs.State.Commit != 3 {
 		t.Errorf("unexpected rs value")
 	}
+}
+
+func TestSnapshotCanBeCompressed(t *testing.T) {
+	tf := func(t *testing.T, nh *NodeHost) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err := nh.SyncRequestSnapshot(ctx, 1, DefaultSnapshotOption)
+		cancel()
+		if err != nil {
+			t.Fatalf("failed to request snapshot %v", err)
+		}
+		logdb := nh.logdb
+		ssList, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+		if err != nil {
+			t.Fatalf("failed to list snapshots: %v", err)
+		}
+		if len(ssList) != 1 {
+			t.Fatalf("failed to get snapshot rec, %d", len(ssList))
+		}
+		fi, err := os.Stat(ssList[0].Filepath)
+		if err != nil {
+			t.Fatalf("failed to get file path %v", err)
+		}
+		if fi.Size() > 1024*364 {
+			t.Errorf("snapshot file not compressed, sz %d", fi.Size())
+		}
+	}
+	snapshotCompressedTest(t, tf)
 }

@@ -35,9 +35,9 @@ import (
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/tests"
 	"github.com/lni/dragonboat/v3/internal/tests/kvpb"
-	"github.com/lni/dragonboat/v3/internal/utils/lang"
-	"github.com/lni/dragonboat/v3/internal/utils/leaktest"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
+	"github.com/lni/goutils/lang"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/goutils/random"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
 
@@ -146,7 +146,7 @@ func (n *mtNodeHost) Start() {
 	createStateMachine := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		ds := tests.NewKVTest(clusterID, nodeID)
-		return rsm.NewNativeStateMachine(clusterID, nodeID, rsm.NewRegularStateMachine(ds), done)
+		return rsm.NewNativeSM(clusterID, nodeID, rsm.NewRegularStateMachine(ds), done)
 	}
 	for i := uint64(1); i <= mtNumOfClusters; i++ {
 		rc.ClusterID = i
@@ -170,7 +170,7 @@ func (n *mtNodeHost) RestartCluster(clusterID uint64) {
 	createStateMachine := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		ds := tests.NewKVTest(clusterID, nodeID)
-		return rsm.NewNativeStateMachine(clusterID,
+		return rsm.NewNativeSM(clusterID,
 			nodeID, rsm.NewRegularStateMachine(ds), done)
 	}
 	rc.ClusterID = clusterID
@@ -534,9 +534,6 @@ func testNodeHostLinearizableReadWorks(t *testing.T, size int) {
 	if err != nil {
 		panic(err)
 	}
-	if len(rec) > int(settings.MaxProposalPayloadSize) {
-		t.Fatalf("input is too big")
-	}
 	testProposalCanBeMade(t, nhList[3], rec)
 	testLinearizableReadReturnExpectedResult(t,
 		nhList[2], []byte(kv.Key), []byte(kv.Val))
@@ -549,11 +546,8 @@ func TestNodeHostLinearizableReadWorksInMostBasicSettings(t *testing.T) {
 
 func TestNodeHostLinearizableReadWorksWithLargePayload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if settings.MaxProposalPayloadSize < uint64(31*1024*1024) {
-		t.Fatalf("MaxProposalPayloadSize not big enough")
-	}
 	testNodeHostLinearizableReadWorks(t,
-		int(settings.MaxProposalPayloadSize-16))
+		int(settings.LargeEntitySize-16))
 }
 
 func getTestKVData() []byte {

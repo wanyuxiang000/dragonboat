@@ -29,10 +29,10 @@ import (
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/logutil"
-	"github.com/lni/dragonboat/v3/internal/utils/random"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/random"
 )
 
 var (
@@ -50,7 +50,9 @@ const (
 )
 
 var (
-	emptyState = pb.State{}
+	emptyState     = pb.State{}
+	maxEntrySize   = settings.Soft.MaxEntrySize
+	inMemGcTimeout = settings.Soft.InMemGCTimeout
 )
 
 // State is the state of a raft node defined in the raft paper, possible states
@@ -207,6 +209,7 @@ type raft struct {
 	readyToRead               []pb.ReadyToRead
 	droppedEntries            []pb.Entry
 	droppedReadIndexes        []pb.SystemCtx
+	quiesce                   bool
 	checkQuorum               bool
 	tickCount                 uint64
 	electionTick              uint64
@@ -308,6 +311,12 @@ func (r *raft) describe() string {
 
 func (r *raft) isObserver() bool {
 	return r.state == observer
+}
+
+func (r *raft) mustBeLeader() {
+	if r.state != leader {
+		plog.Panicf("%s is not a leader", r.describe())
+	}
 }
 
 func (r *raft) setLeaderID(leaderID uint64) {
@@ -421,6 +430,9 @@ func (r *raft) restoreRemotes(ss pb.Snapshot) {
 		plog.Infof("%s restored remote progress of %s [%s]",
 			r.describe(), NodeID(id), r.remotes[id])
 	}
+	if r.selfRemoved() && r.state == leader {
+		r.becomeFollower(r.term, NoLeader)
+	}
 	r.observers = make(map[uint64]*remote)
 	for id := range ss.Membership.Observers {
 		match := uint64(0)
@@ -463,8 +475,18 @@ func (r *raft) timeForRateLimitCheck() bool {
 	return r.tickCount%r.electionTimeout == 0
 }
 
+func (r *raft) timeForInMemGC() bool {
+	return r.tickCount%inMemGcTimeout == 0
+}
+
 func (r *raft) tick() {
+	r.quiesce = false
 	r.tickCount++
+	// this is to work around the language limitation described in
+	// https://github.com/golang/go/issues/9618
+	if r.timeForInMemGC() {
+		r.log.inmem.tryResize()
+	}
 	if r.state == leader {
 		r.leaderTick()
 	} else {
@@ -499,9 +521,7 @@ func (r *raft) nonLeaderTick() {
 }
 
 func (r *raft) leaderTick() {
-	if r.state != leader {
-		panic("leaderTick called on a non-leader node")
-	}
+	r.mustBeLeader()
 	r.electionTick++
 	if r.timeForRateLimitCheck() {
 		if r.rl.Enabled() {
@@ -532,6 +552,10 @@ func (r *raft) leaderTick() {
 }
 
 func (r *raft) quiescedTick() {
+	if !r.quiesce {
+		r.quiesce = true
+		r.log.inmem.resize()
+	}
 	r.electionTick++
 }
 
@@ -637,7 +661,7 @@ func (r *raft) sendReplicateMessage(to uint64) {
 	if rp.isPaused() {
 		return
 	}
-	m, err := r.makeReplicateMessage(to, rp.next, settings.Soft.MaxEntrySize)
+	m, err := r.makeReplicateMessage(to, rp.next, maxEntrySize)
 	if err != nil {
 		// log not available due to compaction, send snapshot
 		if !rp.isActive() {
@@ -659,6 +683,9 @@ func (r *raft) sendReplicateMessage(to uint64) {
 }
 
 func (r *raft) broadcastReplicateMessage() {
+	if r.state != leader {
+		panic("non-leader broadcasting replication msg")
+	}
 	for nid := range r.remotes {
 		if nid != r.nodeID {
 			r.sendReplicateMessage(nid)
@@ -693,6 +720,7 @@ func (r *raft) sendHeartbeatMessage(to uint64,
 // p72 of the raft thesis describe how to use Heartbeat message in the ReadIndex
 // protocol.
 func (r *raft) broadcastHeartbeatMessage() {
+	r.mustBeLeader()
 	if r.readIndex.hasPendingRequest() {
 		ctx := r.readIndex.peepCtx()
 		r.broadcastHeartbeatMessageWithHint(ctx)
@@ -754,6 +782,7 @@ func (r *raft) sortMatchValues() {
 }
 
 func (r *raft) tryCommit() bool {
+	r.mustBeLeader()
 	if len(r.remotes) != len(r.matched) {
 		r.resetMatchValueArray()
 	}
@@ -997,10 +1026,14 @@ func (r *raft) removeNode(nodeID uint64) {
 	r.deleteRemote(nodeID)
 	r.deleteObserver(nodeID)
 	r.clearPendingConfigChange()
+	// step down as leader once it is removed
+	if r.nodeID == nodeID && r.state == leader {
+		r.becomeFollower(r.term, NoLeader)
+	}
 	if r.leaderTransfering() && r.leaderTransferTarget == nodeID {
 		r.abortLeaderTransfer()
 	}
-	if len(r.remotes) > 0 {
+	if r.state == leader && len(r.remotes) > 0 {
 		if r.tryCommit() {
 			r.broadcastReplicateMessage()
 		}
@@ -1371,6 +1404,7 @@ func (r *raft) handleLeaderHeartbeat(m pb.Message) {
 
 // p69 of the raft thesis
 func (r *raft) handleLeaderCheckQuorum(m pb.Message) {
+	r.mustBeLeader()
 	if !r.leaderHasQuorum() {
 		plog.Warningf("%s stepped down, no longer has quorum",
 			r.describe())
@@ -1379,10 +1413,7 @@ func (r *raft) handleLeaderCheckQuorum(m pb.Message) {
 }
 
 func (r *raft) handleLeaderPropose(m pb.Message) {
-	if r.selfRemoved() {
-		plog.Warningf("dropping a proposal, local node has been removed")
-		return
-	}
+	r.mustBeLeader()
 	if r.leaderTransfering() {
 		plog.Warningf("dropping a proposal, leader transfer is ongoing")
 		r.reportDroppedProposal(m)
@@ -1429,10 +1460,7 @@ func (r *raft) addReadyToRead(index uint64, ctx pb.SystemCtx) {
 
 // section 6.4 of the raft thesis
 func (r *raft) handleLeaderReadIndex(m pb.Message) {
-	if r.selfRemoved() {
-		plog.Warningf("dropping a read index request, local node removed")
-		return
-	}
+	r.mustBeLeader()
 	ctx := pb.SystemCtx{
 		High: m.HintHigh,
 		Low:  m.Hint,
@@ -1465,6 +1493,7 @@ func (r *raft) handleLeaderReadIndex(m pb.Message) {
 }
 
 func (r *raft) handleLeaderReplicateResp(m pb.Message, rp *remote) {
+	r.mustBeLeader()
 	rp.setActive()
 	if !m.Reject {
 		paused := rp.isPaused()
@@ -1495,6 +1524,7 @@ func (r *raft) handleLeaderReplicateResp(m pb.Message, rp *remote) {
 }
 
 func (r *raft) handleLeaderHeartbeatResp(m pb.Message, rp *remote) {
+	r.mustBeLeader()
 	rp.setActive()
 	rp.waitToRetry()
 	if rp.match < r.log.lastIndex() {
@@ -1508,6 +1538,7 @@ func (r *raft) handleLeaderHeartbeatResp(m pb.Message, rp *remote) {
 }
 
 func (r *raft) handleLeaderTransfer(m pb.Message, rp *remote) {
+	r.mustBeLeader()
 	target := m.Hint
 	plog.Infof("handleLeaderTransfer called on cluster %d, target %d",
 		r.clusterID, target)

@@ -56,17 +56,17 @@ import (
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/internal/utils/logutil"
-	"github.com/lni/dragonboat/v3/internal/utils/netutil"
-	"github.com/lni/dragonboat/v3/internal/utils/netutil/rubyist/circuitbreaker"
-	"github.com/lni/dragonboat/v3/internal/utils/syncutil"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/netutil"
+	"github.com/lni/goutils/netutil/rubyist/circuitbreaker"
+	"github.com/lni/goutils/syncutil"
 )
 
 const (
-	maxMsgSize = settings.MaxMessageSize
+	maxMsgBatchSize = settings.MaxMessageBatchSize
 	// UnmanagedDeploymentID is the special DeploymentID used when the system is
 	// not managed by master servers.
 	UnmanagedDeploymentID = uint64(1)
@@ -173,14 +173,14 @@ func (sq *sendQueue) increase(msg pb.Message) {
 	if msg.Type != pb.Replicate {
 		return
 	}
-	sq.rl.Increase(pb.GetEntrySliceSize(msg.Entries))
+	sq.rl.Increase(pb.GetEntrySliceInMemSize(msg.Entries))
 }
 
 func (sq *sendQueue) decrease(msg pb.Message) {
 	if msg.Type != pb.Replicate {
 		return
 	}
-	sq.rl.Decrease(pb.GetEntrySliceSize(msg.Entries))
+	sq.rl.Decrease(pb.GetEntrySliceInMemSize(msg.Entries))
 }
 
 // Transport is the transport layer for delivering raft messages and snapshots.
@@ -199,6 +199,7 @@ type Transport struct {
 	sourceAddress       string
 	resolver            INodeAddressResolver
 	stopper             *syncutil.Stopper
+	cstopper            *syncutil.Stopper
 	snapshotLocator     server.GetSnapshotDirFunc
 	raftRPC             raftio.IRaftRPC
 	handlerRemovedFlag  uint32
@@ -216,13 +217,13 @@ func NewTransport(nhConfig config.NodeHostConfig,
 	ctx *server.Context, resolver INodeAddressResolver,
 	locator server.GetSnapshotDirFunc) (*Transport, error) {
 	address := nhConfig.RaftAddress
-	stopper := syncutil.NewStopper()
 	t := &Transport{
 		nhConfig:          nhConfig,
 		serverCtx:         ctx,
 		sourceAddress:     address,
 		resolver:          resolver,
-		stopper:           stopper,
+		stopper:           syncutil.NewStopper(),
+		cstopper:          syncutil.NewStopper(),
 		snapshotLocator:   locator,
 		streamConnections: streamConnections,
 	}
@@ -236,20 +237,19 @@ func NewTransport(nhConfig config.NodeHostConfig,
 		t.raftRPC.Stop()
 		return nil, err
 	}
-	t.stopper.RunWorker(func() {
+	t.cstopper.RunWorker(func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				chunks.Tick()
-			case <-stopper.ShouldStop():
+			case <-t.cstopper.ShouldStop():
 				chunks.Close()
 				return
 			}
 		}
 	})
-
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	t.mu.queues = make(map[string]sendQueue)
 	t.mu.breakers = make(map[string]*circuit.Breaker)
@@ -292,6 +292,7 @@ func (t *Transport) Stop() {
 	t.cancel()
 	t.stopper.Stop()
 	t.raftRPC.Stop()
+	t.cstopper.Stop()
 }
 
 // GetCircuitBreaker returns the circuit breaker used for the specified
@@ -512,13 +513,11 @@ func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
 			requests = append(requests, req)
 			// batch below allows multiple requests to be sent in a single message,
 			// then each request can have multiple log entries.
-			// this batching design is largely for heartbeat messages as entries are
-			// already batched into much smaller number of messages.
-			for done := false; !done && sz < maxMsgSize; {
+			for done := false; !done && sz < maxMsgBatchSize; {
 				select {
 				case req = <-sq.ch:
 					sq.decrease(req)
-					sz += uint64(req.Size())
+					sz += uint64(req.SizeUpperLimit())
 					requests = append(requests, req)
 				default:
 					done = true
@@ -533,7 +532,7 @@ func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
 				continue
 			}
 			twoBatch := false
-			if sz < maxMsgSize || len(requests) == 1 {
+			if sz < maxMsgBatchSize || len(requests) == 1 {
 				batch.Requests = requests
 			} else {
 				twoBatch = true
